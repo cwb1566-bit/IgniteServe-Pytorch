@@ -15,7 +15,7 @@ from typing_extensions import override, Self, TypeGuard
 
 import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncCompile pools
 import torch.fx
-from torch._inductor.codecache import BypassFxGraphCache, FxGraphCache
+from torch._inductor.codecache import BypassFxGraphCache
 from torch._inductor.metrics import CachedMetricsDeltas, CachedMetricsHelper
 from torch._inductor.output_code import (
     CompiledFxGraph,
@@ -197,6 +197,12 @@ class _WireProtocolInput:
     logger_state: _LoggerState
     lowering: _LoweringSerializer
     fake_tensor_mode: _FakeTensorModeSerializer
+    # save_config_portable() intentionally excludes custom graph passes because
+    # they are not part of the ordinary portable config.  Out-of-process
+    # compilation still has to execute them for correctness, so transport them
+    # explicitly across the wire.
+    post_grad_custom_pre_pass: Any
+    post_grad_custom_post_pass: Any
 
     def serialize(self) -> _WireProtocolPickledInput:
         """
@@ -409,13 +415,11 @@ class _SerializedFxCompile(FxCompile):
                 gm, example_inputs, inputs_to_check, graph_kwargs
             )
 
-        try:
-            # _check_for_hop raises BypassFxGraphCache when it detects something
-            # we can't cache (or serialize)
-            FxGraphCache._check_for_hop(gm)
-        except BypassFxGraphCache as e:
-            log.debug("Skipping %s compile: %s", type(self), e)
-            return fallback()
+        # Cacheability and wire serializability are different properties.  In
+        # particular, auto_functionalized higher-order operators are marked
+        # uncacheable but are globally addressable and GraphPickler can carry
+        # them across the process boundary.  Let serialization below decide
+        # whether this graph can use the out-of-process path.
 
         context = torch._guards.TracingContext.try_get()
         constants = CompiledFxGraphConstantsWithGm(gm)
@@ -450,6 +454,8 @@ class _SerializedFxCompile(FxCompile):
                 logger_state,
                 lowering,
                 fake_tensor_mode,
+                config.post_grad_custom_pre_pass,
+                config.post_grad_custom_post_pass,
             ).serialize()
         except (AttributeError, BypassFxGraphCache):
             # For example: AttributeError: Can't pickle local object
@@ -506,7 +512,12 @@ class _SerializedFxCompile(FxCompile):
 
             stack.enter_context(input.virtualized.patch())
             stack.enter_context(input.lowering.patch())
-            stack.enter_context(config.patch(input.config))
+            child_config = {
+                **input.config,
+                "post_grad_custom_pre_pass": input.post_grad_custom_pre_pass,
+                "post_grad_custom_post_pass": input.post_grad_custom_post_pass,
+            }
+            stack.enter_context(config.patch(child_config))
             captured_logs = stack.enter_context(input.logger_state)
             if input.deterministic_guard_for_testing:
                 stack.enter_context(input.deterministic_guard_for_testing)

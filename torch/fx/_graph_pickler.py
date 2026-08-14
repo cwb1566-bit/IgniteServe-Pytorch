@@ -225,7 +225,19 @@ class _TensorPickleData:
         assert not metadata.view_func or isinstance(
             metadata.view_func, torch._subclasses.meta_utils._FakeTensorViewFunc
         )
-        self.metadata = dataclasses.replace(metadata, fake_mode=None)
+        # A FakeTensor view carries a recursively described base tensor.  The
+        # base has its own fake_mode reference, which reaches runtime-only
+        # FakeTensorConverter caches backed by WeakValueDictionary and cannot
+        # cross a process boundary.  Preserve the base metadata and restore
+        # its mode during unpickling, just as we do for the outer tensor.
+        base = metadata.base
+        if metadata.is_view and base is not None:
+            base = dataclasses.replace(base, fake_mode=None)
+        self.metadata = dataclasses.replace(
+            metadata,
+            fake_mode=None,
+            base=base,
+        )
 
         # Some debugging/verification
         for k in MetaTensorDesc._UNSERIALIZABLE:
@@ -241,6 +253,14 @@ class _TensorPickleData:
             self.metadata,
             fake_mode=unpickle_state.fake_mode,
         )
+        if metadata.is_view and metadata.base is not None:
+            metadata = dataclasses.replace(
+                metadata,
+                base=dataclasses.replace(
+                    metadata.base,
+                    fake_mode=unpickle_state.fake_mode,
+                ),
+            )
 
         def with_fake(
             make_meta_t: Callable[[], torch.Tensor], device: Union[torch.device, str]
@@ -407,7 +427,12 @@ class _OpPickleData:
             type["_OpOverloadPickleData"], type["_OpOverloadPacketPickleData"]
         ],
     ) -> "_OpPickleData":
-        if not name.startswith("torch.ops.aten"):  # TODO: What's the full list?
+        # OpOverload and OpOverloadPacket are looked up by their qualified
+        # torch.ops name during unpickling.  Custom namespaces are valid as
+        # long as the owning extension has been imported in the receiver before
+        # deserialization.  Restricting this to aten prevents out-of-process
+        # compilation of graphs containing registered framework/custom ops.
+        if not name.startswith("torch.ops."):
             from torch._inductor.codecache import BypassFxGraphCache
 
             raise BypassFxGraphCache(f"Unable to pickle non-standard op: {name}")

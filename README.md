@@ -1,3 +1,26 @@
+# IgniteServe-Pytorch
+
+**IgniteServe-Pytorch** is a private research fork of PyTorch 2.7.0 that adds process-isolated, metadata-aware parallel compilation of complete FX graphs for [IgniteServe](https://github.com/cwb1566-bit/IgniteServe).
+
+The fork is maintained by the **Cloud-Native Large Model Systems Group (CGCL), Huazhong University of Science and Technology**. It is based exactly on upstream PyTorch commit `134179474539648ba7dee1317959529fbd0e7f89` (`v2.7.0`).
+
+## Fork Highlights
+
+- A persistent `FullFxCompilePool` executes independent `compile_fx -> AOTAutograd -> TorchInductor` jobs in isolated worker processes.
+- Worker prewarm overlaps expensive imports and optional CUDA FakeTensor initialization with model startup.
+- GraphPickler transports symbolic FakeTensor views and globally registered `torch.ops.*` custom operators.
+- Out-of-process compilation preserves custom post-gradient Inductor passes and separates cacheability from transport support.
+- Worker count, nested compiler parallelism, module registration, profiling, and asynchronous pool teardown are explicit controls.
+- A regression test covers symbolic FakeTensor view round trips.
+
+See [IgniteServe parallel-compilation design](docs/igniteserve_parallel_compile.md) and the [deployment guide](docs/igniteserve_deployment.md) before enabling this experimental path.
+
+> This fork changes private PyTorch compiler APIs and has been validated for the documented PyTorch 2.7 / CUDA 12.6 / A100 configuration. The normal PyTorch behavior remains unchanged unless the new pool is imported and used by an integration such as IgniteServe.
+
+---
+
+## Upstream PyTorch
+
 ![PyTorch Logo](https://github.com/pytorch/pytorch/raw/main/docs/source/_static/img/pytorch-logo-dark.png)
 
 --------------------------------------------------------------------------------

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import importlib
 import os
 from typing import Optional, TYPE_CHECKING
 from typing_extensions import override
@@ -15,6 +16,7 @@ from torch._inductor.compile_worker.subproc_pool import (
 )
 from torch._inductor.utils import clear_inductor_caches
 
+from . import config
 from .compile_fx_ext import (
     _OutOfProcessFxCompile,
     _WireProtocolPickledInput,
@@ -25,6 +27,31 @@ from .output_code import complex_memory_overlap as complex_memory_overlap  # noq
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise RuntimeError(f"{name} must be at least 1, got {parsed}")
+    return parsed
+
+
+def _import_worker_modules(extra_env: Optional[Mapping[str, str]]) -> None:
+    value = None if extra_env is None else extra_env.get(
+        "TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS"
+    )
+    if value is None:
+        value = os.environ.get("TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS", "")
+    for module_name in value.split(","):
+        module_name = module_name.strip()
+        if module_name:
+            importlib.import_module(module_name)
 
 
 class _SubprocessFxCompile(_OutOfProcessFxCompile):
@@ -38,7 +65,12 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
 
         # TODO: This is probably the wrong thing to do long-term - but for now
         # let's share the cache so we can identify tests broken by this later.
-        env_vars = ["TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"]
+        env_vars = [
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TRITON_CACHE_DIR",
+            "TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS",
+            "TORCHINDUCTOR_FX_COMPILE_INNER_THREADS",
+        ]
         extra_env = {v: os.environ[v] for v in env_vars if v in os.environ}
 
         f = pool.submit(_SubprocessFxCompile._run_in_child_subprocess, input, extra_env)
@@ -60,9 +92,7 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
     @functools.cache
     def process_pool() -> AnyPool:
         pool = SubprocPool(
-            # TODO: Consider raising this limit if we start using async w/
-            # subprocess and want to compile multiple graphs in parallel.
-            1,
+            _positive_int_env("TORCHINDUCTOR_FX_COMPILE_WORKERS", 1),
             kind=SubprocKind.SPAWN,
         )
 
@@ -93,10 +123,16 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
         # incremented when we clear the cache, send the clock to the worker and
         # only clear caches if the clock changed since last time.
         #
+        _import_worker_modules(extra_env)
+
         clear_inductor_caches()
         torch._inductor.metrics.reset()
 
-        # TODO: turn off config.fx_graph_async_compile
-
-        result = cls._run_in_child(pickled_input, extra_env)
-        return result
+        # Graph-level workers already provide parallelism.  Default the nested
+        # kernel compiler to one worker to avoid graph_workers * compile_threads
+        # process oversubscription.  Advanced users can opt back in explicitly.
+        inner_threads = _positive_int_env(
+            "TORCHINDUCTOR_FX_COMPILE_INNER_THREADS", 1
+        )
+        with config.patch(compile_threads=inner_threads):
+            return cls._run_in_child(pickled_input, extra_env)

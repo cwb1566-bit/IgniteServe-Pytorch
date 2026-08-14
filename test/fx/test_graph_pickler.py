@@ -14,6 +14,9 @@ import torch
 import torch.library
 from torch._dynamo.testing import make_test_cls_with_patches
 from torch._inductor.test_case import TestCase
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx._graph_pickler import GraphPickler
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.common_utils import TEST_WITH_ASAN
 from torch.testing._internal.inductor_utils import HAS_CPU, HAS_GPU
 
@@ -90,6 +93,23 @@ class TestGraphPickler(TestCase):
             return a + b
 
         check_model(self, fn, (torch.tensor([False, True]), torch.tensor([True, True])))
+
+    def test_symbolic_fake_tensor_view(self):
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env)
+        sym = shape_env.create_unbacked_symint()
+        with fake_mode:
+            base = torch.empty((sym, 1))
+            view = base.view(sym)
+
+        payload = GraphPickler.dumps(view)
+        restored = GraphPickler.loads(
+            payload,
+            FakeTensorMode(shape_env=ShapeEnv()),
+        )
+
+        self.assertEqual(str(restored.shape[0]), str(sym))
+        self.assertTrue(restored._is_view())
 
 
 if __name__ == "__main__":
