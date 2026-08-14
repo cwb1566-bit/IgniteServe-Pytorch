@@ -2,7 +2,7 @@
 
 **IgniteServe-Pytorch** is a private research fork of PyTorch 2.7.0 that adds process-isolated, metadata-aware parallel compilation of complete FX graphs for [IgniteServe](https://github.com/cwb1566-bit/IgniteServe).
 
-The fork is maintained by the **Cloud-Native Large Model Systems Group (CGCL), Huazhong University of Science and Technology**. It is based exactly on upstream PyTorch commit `134179474539648ba7dee1317959529fbd0e7f89` (`v2.7.0`).
+The fork is maintained by the **CGCL，Huazhong University of Science and Technology**. It is based exactly on upstream PyTorch commit `134179474539648ba7dee1317959529fbd0e7f89` (`v2.7.0`).
 
 ## Fork Highlights
 
