@@ -372,7 +372,13 @@ class FullFxCompilePool:
         def shutdown() -> None:
             started = time.perf_counter()
             try:
-                pool.shutdown()
+                fast = os.environ.get(
+                    "TORCHINDUCTOR_FULL_FX_FAST_SHUTDOWN", ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if fast:
+                    pool.shutdown_fast()
+                else:
+                    pool.shutdown()
             except BaseException as exc:
                 cls._shutdown_error = exc
             finally:

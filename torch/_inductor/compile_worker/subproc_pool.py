@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
@@ -153,6 +154,10 @@ class SubprocPool:
                 "LD_LIBRARY_PATH": _get_ld_library_path(),
             },
             pass_fds=(subproc_read_fd, subproc_write_fd),
+            # The optional fast shutdown path must release the supervisor and
+            # all spawned compile workers, including their CUDA contexts, as
+            # one unit after every submitted future has completed.
+            start_new_session=True,
         )
         self.write_lock = threading.Lock()
         self.read_thread = threading.Thread(target=self._read_thread, daemon=True)
@@ -239,6 +244,33 @@ class SubprocPool:
             self.process.wait(300)
         except OSError as e:
             log.warning("Ignored OSError in pool shutdown:  %s", e)
+        finally:
+            with self.futures_lock:
+                for future in self.pending_futures.values():
+                    if not future.cancel():
+                        future.set_exception(RuntimeError("SubprocPool closed"))
+                self.pending_futures.clear()
+
+    def shutdown_fast(self) -> None:
+        """Terminate an idle compiler process group after results are durable.
+
+        Callers must ensure all submitted futures have completed. This avoids
+        ProcessPoolExecutor's comparatively expensive graceful interpreter
+        teardown while preserving the normal shutdown path as the default.
+        """
+        try:
+            with self.write_lock:
+                if not self.running:
+                    return
+                self.running = False
+                self.write_pipe.close()
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            self.process.wait(30)
+        except OSError as exc:
+            log.warning("Ignored OSError in fast pool shutdown: %s", exc)
         finally:
             with self.futures_lock:
                 for future in self.pending_futures.values():
