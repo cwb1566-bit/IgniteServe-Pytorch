@@ -220,6 +220,29 @@ def _run_full_fx_prewarm(extra_env: Mapping[str, str]) -> FullFxPrewarmResult:
     )
 
 
+def _run_full_fx_cuda_prewarm(
+    device_index: int,
+    extra_env: Mapping[str, str],
+) -> FullFxPrewarmResult:
+    """Initialize CUDA after import-only prewarm in the same worker pool."""
+    started = time.perf_counter()
+    with contextlib.ExitStack() as stack:
+        if extra_env:
+            stack.enter_context(mock.patch.dict(os.environ, extra_env))
+        torch.cuda.set_device(device_index)
+        from torch._subclasses.fake_tensor import init_gpu_context
+
+        phase_started = time.perf_counter()
+        init_gpu_context(torch.device("cuda", device_index))
+        cuda_init_time_s = time.perf_counter() - phase_started
+    return FullFxPrewarmResult(
+        os.getpid(),
+        time.perf_counter() - started,
+        0.0,
+        cuda_init_time_s,
+    )
+
+
 def _run_full_fx_compile(
     serialized_input: bytes,
     extra_env: Mapping[str, str],
@@ -342,6 +365,7 @@ class FullFxCompilePool:
     """Persistent process pool for complete, mutually isolated compile_fx jobs."""
 
     _prewarm_futures: list[Future[FullFxPrewarmResult]] = []
+    _cuda_prewarm_futures: list[Future[FullFxPrewarmResult]] = []
     _shutdown_thread: Optional[threading.Thread] = None
     _shutdown_error: Optional[BaseException] = None
     _shutdown_elapsed_s: float = 0.0
@@ -366,6 +390,7 @@ class FullFxCompilePool:
         pool = cls.process_pool()
         cls.process_pool.cache_clear()
         cls._prewarm_futures = []
+        cls._cuda_prewarm_futures = []
         cls._shutdown_error = None
         cls._shutdown_elapsed_s = 0.0
 
@@ -440,6 +465,30 @@ class FullFxCompilePool:
             for _ in range(worker_count)
         ]
         return cls._prewarm_futures
+
+    @classmethod
+    def prewarm_cuda_workers(
+        cls,
+        device_index: int,
+    ) -> list[Future[FullFxPrewarmResult]]:
+        """Queue CUDA initialization after an import-only prewarm."""
+        if cls._cuda_prewarm_futures:
+            return cls._cuda_prewarm_futures
+        cls.prewarm_workers()
+        worker_count = _positive_int_env(
+            "TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS", 1
+        )
+        extra_env = cls._worker_environment()
+        pool = cls.process_pool()
+        cls._cuda_prewarm_futures = [
+            pool.submit(_run_full_fx_cuda_prewarm, device_index, extra_env)
+            for _ in range(worker_count)
+        ]
+        return cls._cuda_prewarm_futures
+
+    @classmethod
+    def all_prewarm_futures(cls) -> list[Future[FullFxPrewarmResult]]:
+        return [*cls.prewarm_workers(), *cls._cuda_prewarm_futures]
 
     @staticmethod
     def _tracing_context(
