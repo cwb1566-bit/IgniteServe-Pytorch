@@ -4,8 +4,11 @@ import atexit
 import contextlib
 import dataclasses
 import functools
+import gc
 import importlib
 import os
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -69,6 +72,13 @@ class FullFxPrewarmResult:
     prewarm_time_s: float
     imports_time_s: float
     cuda_init_time_s: float
+
+
+@dataclass
+class FullFxCacheResetResult:
+    worker_pid: int
+    elapsed_s: float
+    cleared: list[str]
 
 
 @dataclass
@@ -240,6 +250,47 @@ def _run_full_fx_cuda_prewarm(
         time.perf_counter() - started,
         0.0,
         cuda_init_time_s,
+    )
+
+
+def _run_full_fx_cache_reset(
+    barrier_dir: str,
+    worker_count: int,
+) -> FullFxCacheResetResult:
+    """Clear model-level compiler caches in every persistent pool worker."""
+    started = time.perf_counter()
+    cleared: list[str] = []
+    try:
+        torch._dynamo.reset()
+        cleared.append("torch._dynamo")
+    except Exception:
+        pass
+    try:
+        from torch._inductor import codecache
+
+        for name in ("PyCodeCache", "CppCodeCache", "CUDACodeCache"):
+            cache = getattr(codecache, name, None)
+            clear = getattr(cache, "cache_clear", None)
+            if clear is not None:
+                clear()
+                cleared.append(name)
+    except Exception:
+        pass
+    gc.collect()
+
+    # Every submitted reset task blocks here until all worker PIDs have
+    # arrived. ProcessPoolExecutor must therefore dispatch one task to every
+    # worker instead of executing multiple short reset tasks on one process.
+    marker = os.path.join(barrier_dir, str(os.getpid()))
+    with open(marker, "x", encoding="utf-8"):
+        pass
+    deadline = time.monotonic() + 30.0
+    while len(os.listdir(barrier_dir)) < worker_count:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Timed out resetting Full-FX worker caches")
+        time.sleep(0.005)
+    return FullFxCacheResetResult(
+        os.getpid(), time.perf_counter() - started, cleared
     )
 
 
@@ -489,6 +540,31 @@ class FullFxCompilePool:
     @classmethod
     def all_prewarm_futures(cls) -> list[Future[FullFxPrewarmResult]]:
         return [*cls.prewarm_workers(), *cls._cuda_prewarm_futures]
+
+    @classmethod
+    def reset_model_caches(cls) -> list[FullFxCacheResetResult]:
+        """Clear per-model Python/code caches while retaining worker PIDs."""
+        if cls.process_pool.cache_info().currsize == 0:
+            return []
+        worker_count = _positive_int_env(
+            "TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS", 1
+        )
+        barrier_dir = tempfile.mkdtemp(prefix="fullfx-cache-reset-")
+        try:
+            futures = [
+                cls.process_pool().submit(
+                    _run_full_fx_cache_reset, barrier_dir, worker_count
+                )
+                for _ in range(worker_count)
+            ]
+            results = [future.result() for future in futures]
+            if len({result.worker_pid for result in results}) != worker_count:
+                raise RuntimeError(
+                    "Full-FX cache reset did not reach every worker"
+                )
+            return results
+        finally:
+            shutil.rmtree(barrier_dir, ignore_errors=True)
 
     @staticmethod
     def _tracing_context(
