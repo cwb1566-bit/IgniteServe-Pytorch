@@ -27,7 +27,8 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   void register_generator_state(const at::Generator& generator);
   void capture_begin(
       MempoolId_t pool = {0, 0},
-      cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
+      cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal,
+      bool manage_default_generator = true);
   void capture_end();
   void replay();
   void reset();
@@ -72,6 +73,12 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // that are managed by the CUDA Graph
   ska::flat_hash_map<c10::intrusive_ptr<at::CUDAGeneratorState>, uint64_t>
       captured_generator_states_;
+
+  // Model-only inference graphs may be captured concurrently with sampling on
+  // another stream. In that case the process-wide default generator must stay
+  // owned by the foreground path. Random ops inside such a capture fail closed
+  // because no generator state is placed in capture mode.
+  bool manage_default_generator_{true};
 
   // Device where capture occurred. Right now, for simplicity, we require all ops
   // in a capture to run on the same device, but this is a limitation of CUDAGraph,

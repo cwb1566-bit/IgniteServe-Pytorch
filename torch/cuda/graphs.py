@@ -53,7 +53,12 @@ class CUDAGraph(torch._C._CUDAGraph):
     def __new__(cls):
         return super().__new__(cls)
 
-    def capture_begin(self, pool=None, capture_error_mode="global"):
+    def capture_begin(
+        self,
+        pool=None,
+        capture_error_mode="global",
+        manage_default_generator=True,
+    ):
         r"""Begin capturing CUDA work on the current stream.
 
         Typically, you shouldn't call ``capture_begin`` yourself.
@@ -69,8 +74,17 @@ class CUDAGraph(torch._C._CUDAGraph):
                 may be unsafe. "global" will error on actions in other threads, "thread_local" will only error for
                 actions in the current thread, and "relaxed" will not error on these actions. Do NOT change this setting
                 unless you're familiar with `cudaStreamCaptureMode <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85>`_
+            manage_default_generator (bool, optional): If ``True``, register the
+                current device's default CUDA generator with this graph. Set to
+                ``False`` only for graph bodies that contain no random ops and
+                must not take ownership of foreground RNG state. Defaults to
+                ``True``.
         """  # noqa: B950
-        super().capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+        super().capture_begin(
+            pool=pool,
+            capture_error_mode=capture_error_mode,
+            manage_default_generator=manage_default_generator,
+        )
 
     def capture_end(self):
         r"""End CUDA graph capture on the current stream.
@@ -132,6 +146,16 @@ class graph:
             may be unsafe. "global" will error on actions in other threads, "thread_local" will only error for
             actions in the current thread, and "relaxed" will not error on actions. Do NOT change this setting
             unless you're familiar with `cudaStreamCaptureMode <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85>`_
+        synchronize_before_capture (bool, optional): Synchronize the device
+            before entering capture. Defaults to ``True``.
+        collect_before_capture (bool, optional): Run Python garbage collection
+            before entering capture. Defaults to ``True``.
+        empty_cache_before_capture (bool, optional): Release unused caching
+            allocator blocks before entering capture. Defaults to ``True``.
+        manage_default_generator (bool, optional): Register the default CUDA
+            generator with this graph. Set to ``False`` only when the graph has
+            no random ops and foreground RNG must remain independent. Defaults
+            to ``True``.
 
     .. note::
         For effective memory sharing, if you pass a ``pool`` used by a previous capture and the previous capture
@@ -152,11 +176,18 @@ class graph:
         pool=None,
         stream=None,
         capture_error_mode: str = "global",
+        synchronize_before_capture: bool = True,
+        collect_before_capture: bool = True,
+        empty_cache_before_capture: bool = True,
+        manage_default_generator: bool = True,
     ):
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
         # Not thread safe, but graphs already have the general (explicitly documented)
         # restriction that only one capture may be underway at a time in the process.
-        if self.__class__.default_capture_stream is None:
+        if (
+            stream is None
+            and self.__class__.default_capture_stream is None
+        ):
             self.__class__.default_capture_stream = torch.cuda.Stream()
 
         self.pool = () if pool is None else (pool,)
@@ -167,19 +198,28 @@ class graph:
         self.stream_ctx = torch.cuda.stream(self.capture_stream)
         self.cuda_graph = cuda_graph
         self.capture_error_mode = capture_error_mode
+        self.synchronize_before_capture = synchronize_before_capture
+        self.collect_before_capture = collect_before_capture
+        self.empty_cache_before_capture = empty_cache_before_capture
+        self.manage_default_generator = manage_default_generator
 
     def __enter__(self):
         # Free as much memory as we can for the graph
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        if self.synchronize_before_capture:
+            torch.cuda.synchronize()
+        if self.collect_before_capture:
+            gc.collect()
+        if self.empty_cache_before_capture:
+            torch.cuda.empty_cache()
 
         # Stackoverflow seems comfortable with this pattern
         # https://stackoverflow.com/questions/26635684/calling-enter-and-exit-manually#39172487
         self.stream_ctx.__enter__()
 
         self.cuda_graph.capture_begin(
-            *self.pool, capture_error_mode=self.capture_error_mode
+            *self.pool,
+            capture_error_mode=self.capture_error_mode,
+            manage_default_generator=self.manage_default_generator,
         )
 
     def __exit__(self, exc_type, exc_value, traceback):
